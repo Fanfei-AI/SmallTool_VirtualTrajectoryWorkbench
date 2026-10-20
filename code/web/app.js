@@ -1,15 +1,16 @@
 const $=id=>document.getElementById(id);
 const message=t=>$('message').textContent=t;
-let map,markers=[],pins=[],base,routeLine,trailLine,dot,active=false,busy=false,runPid=null,trail=[],lastTime=0,routeLoaded=false,routeVersion=null;
+let map,markers=[],pins=[],base,routeLine,trailLine,dot,active=false,busy=true,runPid=null,trail=[],lastTime=0,routeLoaded=false,routeVersion=null;
 let selectedPin=null,movingPin=null,insertingPin=null,pointMenuOpen=false;
 let startRequestPending=false,statusRevision=0;
+let paused=false,pauseMode='hold',exited=false,ready=false,currentPhase='idle',mapAvailable=false;
 function showLoading(loading){$('mapLoading').hidden=!loading;$('mapLoading').setAttribute('aria-busy',String(loading));$('start').textContent=loading?'连接中…':'启动轨迹';}
 async function api(path,body){const r=await fetch('/api/'+path,body===undefined?{cache:'no-store'}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const data=await r.json();if(!r.ok)throw Error(data.error||'请求失败');return data;}
 function pace(id){const raw=$(id+'Minutes').value.trim(),minutes=Number(raw);if(!raw||!Number.isFinite(minutes)||minutes<0.5||minutes>120)throw Error('配速请输入 0.5～120 分钟，可使用小数。');return minutes;}
 function setPace(id,value){$(id+'Minutes').value=value;}
 function fmt(p){let s=Math.round(p*60);return `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;}
 function config(){return {pins,paceMin:pace('paceMin'),paceMax:pace('paceMax'),jitter:+$('jitter').value,pinJitter:+$('pinJitter').value,hz:+$('hz').value,loopEnabled:$('loopEnabled').checked,loopStart:Number($('loopStart').value)};}
-function lock(){document.querySelectorAll('input').forEach(e=>e.disabled=active||busy);for(const id of ['start','save','cancelMove'])$(id).disabled=active||busy;$('parameterMask').hidden=!active;$('parameterContent').inert=active||busy;$('parameterArea').classList.toggle('is-locked',active);$('stop').classList.toggle('is-running',active);if((active||busy)&&(selectedPin!==null||movingPin!==null||insertingPin!==null)){selectedPin=null;movingPin=null;insertingPin=null;map.closePopup();redraw();}}
+function lock(){ $('pauseButton').disabled=busy||!['running','paused','resuming','holding_endpoint'].includes(currentPhase);$('pauseButton').textContent=paused?'▶':'⏸';$('pauseButton').title=paused?'继续轨迹':'暂停轨迹';$('pauseButton').setAttribute('aria-label',$('pauseButton').title); document.querySelectorAll('input').forEach(e=>e.disabled=active||busy);for(const id of ['start','save','cancelMove'])$(id).disabled=active||busy;$('parameterMask').hidden=!active;$('parameterContent').inert=active||busy;$('parameterArea').classList.toggle('is-locked',active);$('stop').classList.toggle('is-running',active);if((active||busy)&&(selectedPin!==null||movingPin!==null||insertingPin!==null)){selectedPin=null;movingPin=null;insertingPin=null;map.closePopup();redraw();}}
 function updateEditHint(){
   $('mapEditHelp').hidden=movingPin===null&&insertingPin===null;
   $('cancelMove').hidden=movingPin===null&&insertingPin===null;$('cancelMove').textContent=insertingPin!==null?'取消插入':'取消移动';
@@ -97,7 +98,7 @@ function initMenus(){
   document.addEventListener('click',e=>{if(!e.target.closest('.save-wrap'))$('saveMenu').hidden=true;});
   document.addEventListener('keydown',e=>{if(e.key==='Escape'){insertingPin=null;movingPin=null;$('saveMenu').hidden=true;updateEditHint();}});
 }
-function redraw(){
+function redraw(){if(!mapAvailable){updateEditHint();return;}
   markers.forEach(m=>m.remove());markers=[];
   pins.forEach((p,i)=>{
     const m=L.marker(p,{draggable:false,bubblingMouseEvents:false,icon:L.divIcon({className:'pin-target'+(selectedPin===i?' selected':''),html:`<span class="pin-face">${i+1}</span>`,iconSize:[44,44],iconAnchor:[22,22],popupAnchor:[0,-16]})}).addTo(map);
@@ -109,8 +110,57 @@ function redraw(){
     m.on('click',()=>{if(movingPin!==null||insertingPin!==null)mapPoint(m.getLatLng());});markers.push(m);
   });base.setLatLngs(pins);updateEditHint();
 }
-async function action(name){busy=true;lock();try{const body=name==='stop'?{}:config();if(name==='start'){startRequestPending=true;statusRevision++;showLoading(true);$('phase').textContent='正在连接手机…';}const r=await api(name,body);message(name==='save'?'设置已保存。':name==='start'?'正在接管定位并连接手机，请保持 USB 连接。':r.message);if(name==='start'){active=true;routeLoaded=false;trail=[];trailLine.setLatLngs([]);routeLine.setLatLngs([]);}if(name==='stop')active=true;}catch(e){if(name==='start'){showLoading(false);$('phase').textContent='启动未完成';}message(e.message);}finally{if(name==='start'){startRequestPending=false;statusRevision++;}busy=false;lock();}}
-const names={idle:'尚未启动',connecting:'连接手机中…',running:'正在移动',holding_endpoint:'已到达 · 持续保持终点',simulation_cleared:'',failed:'定位任务出错',unresponsive:'连接状态未确认'};
-async function poll(){const revision=statusRevision;try{const s=await api('status');if(startRequestPending||revision!==statusRevision)return;showLoading(s.phase==='connecting');active=['connecting','running','holding_endpoint','unresponsive'].includes(s.phase);lock();$('phase').textContent=names[s.phase]??s.phase;if(s.loop&&s.phase==='running')$('phase').textContent=s.lap>0?'循环中 · 第 '+s.lap+' 圈':'正在前往循环起点';$('phase').title=s.error||'';if(s.pid!==runPid){runPid=s.pid;routeLoaded=false;trail=[];lastTime=0;trailLine.setLatLngs([]);}if(s.route_version!==routeVersion){routeLoaded=false;}if(['running','holding_endpoint'].includes(s.phase)&&!routeLoaded){const r=await api('route');if(r.points.length){routeLine.setLatLngs(r.points);routeLoaded=true;routeVersion=s.route_version;}}if(s.latitude!==undefined&&s.time!==lastTime){const point=[s.latitude,s.longitude];dot.setStyle({opacity:1,fillOpacity:1});dot.setLatLng(point);if(!trail.length||L.latLng(trail[trail.length-1]).distanceTo(point)>.05)trail.push(point);if(trail.length>12000)trail.splice(0,2000);trailLine.setLatLngs(trail);lastTime=s.time;$('stats').textContent=`${s.latitude.toFixed(6)}, ${s.longitude.toFixed(6)}　｜　${(s.distance/1000).toFixed(2)} / ${(s.total/1000).toFixed(2)} km　｜　${s.pace?fmt(s.pace)+' / km':'静止保持'}`;}}catch(e){if(!startRequestPending&&revision===statusRevision){showLoading(false);$('phase').textContent='工作台连接中断';}}finally{setTimeout(poll,300);}}
-async function init(){if(!window.L){message('地图组件加载失败，请检查网络后刷新页面。');return;}map=L.map('map',{attributionControl:false}).setView([20,0],2);const tiles=L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'}).addTo(map);tiles.on('tileerror',()=>message('部分在线地图未加载，请检查网络。'));base=L.polyline([],{color:'#8498ae',weight:2,dashArray:'5 8'}).addTo(map);routeLine=L.polyline([],{color:'#1973e8',weight:4}).addTo(map);trailLine=L.polyline([],{color:'#0da684',weight:4}).addTo(map);dot=L.circleMarker([20,0],{radius:7,color:'#fff',weight:2,fillColor:'#ef553f',opacity:0,fillOpacity:0}).addTo(map);map.on('click',e=>mapPoint(e.latlng));$('cancelMove').onclick=()=>{if(active||busy)return;movingPin=null;insertingPin=null;updateEditHint();};initMenus();for(const name of ['start','stop'])$(name).onclick=()=>action(name);try{const c=await api('config');pins=c.pins;$('loopEnabled').checked=!!c.loopEnabled;$('loopStart').value=c.loopStart||1;setPace('paceMin',c.paceMin);setPace('paceMax',c.paceMax);for(const k of ['jitter','pinJitter','hz'])$(k).value=c[k];redraw();if(pins.length)map.fitBounds(pins,{maxZoom:16,padding:[40,40]});}catch(e){message(e.message);}poll();}
+async function action(name){if(busy||!ready)return;busy=true;lock();try{const body=name==='stop'?{}:config();if(name==='start'){startRequestPending=true;statusRevision++;showLoading(true);$('phase').textContent='正在连接手机…';}const r=await api(name,body);message(name==='save'?'设置已保存。':name==='start'?'正在接管定位并连接手机，请保持 USB 连接。':r.message);if(name==='start'){active=true;routeLoaded=false;trail=[];trailLine.setLatLngs([]);routeLine.setLatLngs([]);}if(name==='stop')active=true;}catch(e){if(name==='start'){showLoading(false);$('phase').textContent='启动未完成';}message(e.message);}finally{if(name==='start'){startRequestPending=false;statusRevision++;}busy=false;lock();}}
+const names={paused:'已暂停',resuming:'正在平滑返回轨迹',idle:'尚未启动',connecting:'连接手机中…',running:'正在移动',holding_endpoint:'已到达 · 持续保持终点',simulation_cleared:'',failed:'定位任务出错',unresponsive:'连接状态未确认'};
+async function poll(){if(exited)return;const revision=statusRevision;try{const s=await api('status');if(exited||startRequestPending||revision!==statusRevision)return;currentPhase=s.phase;paused=s.phase==='paused';showLoading(s.phase==='connecting');active=['connecting','running','paused','resuming','holding_endpoint','unresponsive'].includes(s.phase);if(s.error)message(s.error);lock();$('phase').textContent=s.phase==='failed'&&s.error?s.error.split('；')[0]:(names[s.phase]??s.phase);if(s.loop&&s.phase==='running')$('phase').textContent=s.lap>0?'循环中 · 第 '+s.lap+' 圈':'正在前往循环起点';$('phase').title=s.error||'';if(s.pid!==runPid){runPid=s.pid;routeLoaded=false;trail=[];lastTime=0;trailLine.setLatLngs([]);}if(s.route_version!==routeVersion){routeLoaded=false;}if(['running','paused','resuming','holding_endpoint'].includes(s.phase)&&!routeLoaded){const r=await api('route');if(r.points.length){routeLine.setLatLngs(r.points);routeLoaded=true;routeVersion=s.route_version;}}if(s.latitude!==undefined&&s.time!==lastTime){const point=[s.latitude,s.longitude];dot.setStyle({opacity:1,fillOpacity:1});dot.setLatLng(point);if(!trail.length||(!window.L||L.latLng(trail[trail.length-1]).distanceTo(point)>.05))trail.push(point);if(trail.length>12000)trail.splice(0,2000);trailLine.setLatLngs(trail);lastTime=s.time;$('stats').textContent=`${s.latitude.toFixed(6)}, ${s.longitude.toFixed(6)}　｜　${(s.distance/1000).toFixed(2)} / ${(s.total/1000).toFixed(2)} km　｜　${s.pace?fmt(s.pace)+' / km':'静止保持'}`;}}catch(e){if(!startRequestPending&&revision===statusRevision){showLoading(false);$('phase').textContent='工作台连接中断';}}finally{if(!exited)setTimeout(poll,300);}}
+function initControlButtons(){
+  $('pauseOptions').onclick=()=>{$('pauseMenu').hidden=!$('pauseMenu').hidden;};
+  for(const b of document.querySelectorAll('[data-mode]'))b.onclick=async()=>{
+    pauseMode=b.dataset.mode;$('pauseMenu').hidden=true;
+    document.querySelectorAll('[data-mode]').forEach(x=>x.classList.toggle('chosen',x===b));
+    if(paused)await pauseAction('pause');
+  };
+  $('pauseButton').onclick=()=>pauseAction(paused?'resume':'pause');
+  document.addEventListener('click',e=>{if(!e.target.closest('#pauseControls'))$('pauseMenu').hidden=true;});
+  $('exitWorkbench').onclick=async()=>{
+    if(busy||!ready)return;
+    if(!confirm('确定退出工作台吗？将先清除虚拟定位，再关闭本工作台的后台进程。'))return;
+    busy=true;lock();$('exitWorkbench').disabled=true;message('正在清除定位并退出，请保持USB连接…');
+    try{await api('exit',{});exited=true;statusRevision++;active=false;showLoading(false);$('phase').textContent='工作台已退出';message('后台服务已关闭，可以关闭此页面。手机端真实定位请自行确认。');document.querySelectorAll('button,input').forEach(e=>e.disabled=true);}
+    catch(e){message(e.message);busy=false;$('exitWorkbench').disabled=false;lock();}
+  };
+}
+async function pauseAction(name){
+  if(busy||!ready)return;busy=true;lock();
+  try{await api(name,{mode:pauseMode});message(name==='resume'?'正在继续轨迹…':pauseMode==='hold'?'正在暂停，停留原地…':'正在暂停，原地微动…');}
+  catch(e){message(e.message);}finally{busy=false;lock();}
+}
+async function init(){
+  const noop={setLatLngs(){},setStyle(){},setLatLng(){},closePopup(){},fitBounds(){}};
+  map=base=routeLine=trailLine=dot=noop;
+  initMenus();initControlButtons();for(const name of ['start','stop'])$(name).onclick=()=>action(name);
+  lock();$('phase').textContent='正在同步后台状态…';
+  const mapReady=new Promise(resolve=>{const script=document.createElement('script');script.src='https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';script.onload=()=>resolve(true);script.onerror=()=>resolve(false);document.head.append(script);setTimeout(()=>resolve(false),8000);});
+  try{
+    const state=await api('initialize');const c=state.config;
+    pins=c.pins;$('loopEnabled').checked=!!c.loopEnabled;$('loopStart').value=c.loopStart||1;
+    setPace('paceMin',c.paceMin);setPace('paceMax',c.paceMax);for(const k of ['jitter','pinJitter','hz'])$(k).value=c[k];
+    currentPhase=state.status.phase;active=['connecting','running','paused','resuming','holding_endpoint','unresponsive'].includes(currentPhase);paused=currentPhase==='paused';
+    ready=true;busy=false;lock();poll();
+  }catch(e){message('初始化失败，请刷新页面重试：'+e.message);}
+  const loaded=await mapReady;
+  if(!loaded||!window.L){$('mapNotice').hidden=false;$('mapNotice').textContent+=' 地图组件未加载，暂不能编辑地图点位；保存的轨迹和后台控制仍可使用。';return;}
+  map=L.map('map',{attributionControl:false}).setView([20,0],2);mapAvailable=true;
+  let tileErrors=0;let tileTimer;
+  const tiles=L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19});
+  tiles.on('loading',()=>{tileErrors=0;clearTimeout(tileTimer);tileTimer=setTimeout(()=>$('mapNotice').hidden=false,10000);});
+  tiles.on('tileerror',()=>{tileErrors++;$('mapNotice').hidden=false;});
+  tiles.on('load',()=>{clearTimeout(tileTimer);$('mapNotice').hidden=tileErrors===0;});tiles.addTo(map);
+  base=L.polyline([],{color:'#8498ae',weight:2,dashArray:'5 8'}).addTo(map);
+  routeLine=L.polyline([],{color:'#1973e8',weight:4}).addTo(map);trailLine=L.polyline(trail,{color:'#0da684',weight:4}).addTo(map);
+  dot=L.circleMarker([20,0],{radius:7,color:'#fff',weight:2,fillColor:'#ef553f',opacity:0,fillOpacity:0}).addTo(map);
+  routeLoaded=false;lastTime=0;map.on('click',e=>mapPoint(e.latlng));
+  $('cancelMove').onclick=()=>{if(active||busy)return;movingPin=null;insertingPin=null;updateEditHint();};
+  redraw();if(pins.length)map.fitBounds(pins,{maxZoom:16,padding:[40,40]});
+}
 init();

@@ -1,10 +1,11 @@
 import json
+import sys
+import socket
 import os
 import subprocess
 import threading
 import time
 import uuid
-import sys
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from trajectory import validate, Route, Journey
@@ -35,8 +36,17 @@ def processes():
         if str(ROOT/'worker.py').lower() in cmd: current.append(item['ProcessId'])
     return current
 
+def wait_stopped(which,seconds=20):
+    deadline=time.monotonic()+seconds
+    while time.monotonic()<deadline:
+        current=processes()
+        if not current: return
+        time.sleep(0.5)
+    raise RuntimeError('旧定位任务尚未退出，请稍后重试；没有启动第二个任务')
+
 def launch(mode):
     (DATA/'stop.flag').unlink(missing_ok=True)
+    save(DATA/'control.json',dict(mode='running'))
     save(DATA/'status.json',dict(phase='connecting',time=time.time()))
     with (DATA/'worker.log').open('a',encoding='utf-8') as log:
         startup=subprocess.STARTUPINFO()
@@ -47,16 +57,30 @@ def launch(mode):
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self,*a,**kw): super().__init__(*a,directory=str(ROOT/'web'),**kw)
     def log_message(self,*args): pass
+    def end_headers(self):
+        self.send_header('Cache-Control','no-store, max-age=0')
+        super().end_headers()
     def reply(self,obj,code=200):
         b=json.dumps(obj,ensure_ascii=False).encode()
         self.send_response(code); self.send_header('Content-Type','application/json; charset=utf-8'); self.send_header('Cache-Control','no-store'); self.send_header('Content-Length',str(len(b))); self.end_headers(); self.wfile.write(b)
     def do_GET(self):
+        if 'If-Modified-Since' in self.headers: del self.headers['If-Modified-Since']
+        if 'If-None-Match' in self.headers: del self.headers['If-None-Match']
         if self.path=='/api/instance': return self.reply(dict(project=str(ROOT.parent),pid=os.getpid()))
+        if self.path=='/api/initialize':
+            current=processes()
+            state=read(DATA/'status.json',dict(phase='idle'))
+            if current and state.get('phase') not in ('running','paused','resuming','holding_endpoint','connecting'):
+                state={**state,'phase':'unresponsive'}
+            elif not current and state.get('phase') in ('running','paused','resuming','holding_endpoint','connecting'):
+                state={**state,'phase':'failed','error':'上次定位进程已经结束；请检查手机连接后重新启动'}
+                save(DATA/'status.json',state)
+            return self.reply(dict(config=read(DATA/'config.json',DEFAULT),status=state))
         if self.path=='/api/config': return self.reply(read(DATA/'config.json',DEFAULT))
         if self.path=='/api/history': return self.reply(read(DATA/'history.json',[]))
         if self.path=='/api/status':
             s=read(DATA/'status.json',dict(phase='idle'))
-            if s.get('phase') in ('running','holding_endpoint','connecting') and time.time()-s.get('time',0)>15:
+            if s.get('phase') in ('running','paused','resuming','holding_endpoint','connecting') and time.time()-s.get('time',0)>15:
                 s={**s,'phase':'unresponsive','error':'定位状态超过 15 秒未更新，连接或进程可能中断；真实定位未确认恢复'}
             return self.reply(s)
         if self.path=='/api/route': return self.reply(read(DATA/'route.json',dict(points=[])))
@@ -76,6 +100,26 @@ class Handler(SimpleHTTPRequestHandler):
             if size>100000: raise ValueError('请求过大')
             body=json.loads(self.rfile.read(size) or '{}')
             with LOCK:
+                if self.path in ('/api/pause','/api/resume'):
+                    state=read(DATA/'status.json',{})
+                    if state.get('phase') not in ('running','paused','resuming','holding_endpoint') or time.time()-state.get('time',0)>15:
+                        raise ValueError('当前没有可暂停或继续的轨迹')
+                    mode='running' if self.path=='/api/resume' else body.get('mode','hold')
+                    if mode not in ('running','hold','jitter'): raise ValueError('暂停模式无效')
+                    save(DATA/'control.json',dict(mode=mode))
+                    return self.reply(dict(ok=True))
+                if self.path=='/api/exit':
+                    current=processes()
+                    state=read(DATA/'status.json',{})
+                    if current:
+                        (DATA/'stop.flag').touch(); wait_stopped('current',30)
+                    elif state.get('phase') not in ('idle','simulation_cleared',None):
+                        launch('clear'); wait_stopped('current',30)
+                    if (current or state.get('phase') not in ('idle','simulation_cleared',None)) and read(DATA/'status.json',{}).get('phase')!='simulation_cleared':
+                        raise ValueError('未确认清除虚拟定位，工作台保留运行，请检查手机连接后重试')
+                    self.reply(dict(ok=True))
+                    threading.Thread(target=self.server.shutdown,daemon=True).start()
+                    return
                 if self.path=='/api/history/delete':
                     record_id=body.get('id')
                     if not isinstance(record_id,str) or not record_id:
@@ -116,5 +160,14 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.reply(dict(error='不存在'),404)
         except Exception as exc: self.reply(dict(error=str(exc)),400)
 
+class WorkbenchServer(ThreadingHTTPServer):
+    allow_reuse_address=False
+    def server_bind(self):
+        if hasattr(socket,'SO_EXCLUSIVEADDRUSE'):
+            self.socket.setsockopt(socket.SOL_SOCKET,socket.SO_EXCLUSIVEADDRUSE,1)
+        super().server_bind()
+
 if __name__=='__main__':
-    ThreadingHTTPServer(('127.0.0.1',PORT),Handler).serve_forever()
+    server=WorkbenchServer(('127.0.0.1',PORT),Handler)
+    try: server.serve_forever()
+    finally: server.server_close()
